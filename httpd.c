@@ -5,8 +5,26 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <errno.h>
 
 #define PORT 40000
+
+static void reap_children(int signum)
+{
+   (void)signum;
+
+   /* waitpid() with WNOHANG returns immediately if no child has exited. */
+   int saved_errno = errno;
+
+   while (waitpid(-1, NULL, WNOHANG) > 0)
+   {
+      /* reap all terminated children */
+   }
+
+   errno = saved_errno;
+}
 
 static void handle_request(int nfd)
 {
@@ -32,8 +50,7 @@ static void handle_request(int nfd)
       printf("Request: %s", line);
    }
 
-   /* Do not close the socket until the client does.
- *       For now, read and ignore any remaining lines. */
+   /* Do not close the socket until the client does. */
    while ((num = getline(&line, &size, network)) >= 0)
    {
       (void)num;
@@ -60,7 +77,6 @@ static void run_service(int fd)
       pid_t pid = fork();
       if (pid < 0)
       {
-         /* If fork fails, close the connected socket and continue. */
          perror("fork");
          close(nfd);
          continue;
@@ -69,14 +85,8 @@ static void run_service(int fd)
       if (pid == 0)
       {
          /* Child process: handle the request. */
-
-         /* After fork(), file descriptors are duplicated. Parent and child should
- *             close descriptors they do not need. */
          close(fd); /* child does not accept new connections */
-
          handle_request(nfd);
-
-         /* Exit child without running parent-side cleanup. */
          _exit(0);
       }
 
@@ -87,6 +97,13 @@ static void run_service(int fd)
 
 int main(void)
 {
+   /* Register signal handler to reap terminated children. */
+   if (signal(SIGCHLD, reap_children) == SIG_ERR)
+   {
+      perror("signal");
+      exit(1);
+   }
+
    /* Create server socket and bind to PORT. */
    int fd = create_service(PORT);
    if (fd == -1)
