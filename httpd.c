@@ -9,13 +9,17 @@
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #define PORT 40000
+#define READ_BUF_SIZE 4096
 
 static void reap_children(int signum)
 {
    (void)signum;
 
+   /* waitpid() with WNOHANG returns immediately if no child has exited. */
    int saved_errno = errno;
 
    while (waitpid(-1, NULL, WNOHANG) > 0)
@@ -102,9 +106,13 @@ static void send_response(int nfd, const char *status, const char *body, int sen
    }
 }
 
+/* Parse: METHOD PATH VERSION
+ *    Split by spaces by inserting '\0' terminators. */
 static int parse_request_line(char *line, char **method, char **path, char **version)
 {
-   /* Parse Split by spaces by inserting '\0' terminators. */
+   char *space1;
+   char *space2;
+   char *p;
 
    *method = NULL;
    *path = NULL;
@@ -118,8 +126,8 @@ static int parse_request_line(char *line, char **method, char **path, char **ver
    *method = line;
 
    /* Find first space */
-   char *space1 = NULL;
-   for (char *p = line; *p != '\0'; p++)
+   space1 = NULL;
+   for (p = line; *p != '\0'; p++)
    {
       if (*p == ' ')
       {
@@ -141,8 +149,8 @@ static int parse_request_line(char *line, char **method, char **path, char **ver
    }
 
    /* Find second space */
-   char *space2 = NULL;
-   for (char *p = *path; *p != '\0'; p++)
+   space2 = NULL;
+   for (p = *path; *p != '\0'; p++)
    {
       if (*p == ' ')
       {
@@ -166,11 +174,100 @@ static int parse_request_line(char *line, char **method, char **path, char **ver
    return 0;
 }
 
+static void serve_static_file(int nfd, const char *reqpath, const char *method)
+{
+   /* reqpath starts with a leading '/' per HTTP request; remove it for local path */
+   const char *p = reqpath;
+   if (*p == '/')
+   {
+      p++;
+   }
+
+   /* Require a filename; reject empty path */
+   if (*p == '\0')
+   {
+      const char *body = "<html><body>400 Bad Request</body></html>\n";
+      send_response(nfd, "400 Bad Request", body, 1);
+      return;
+   }
+
+   /* Prevent directory traversal attempts */
+   if (strstr(p, "..") != NULL)
+   {
+      const char *body = "<html><body>403 Permission Denied</body></html>\n";
+      send_response(nfd, "403 Permission Denied", body, 1);
+      return;
+   }
+
+   /* Stat the file to get size and check existence/permissions */
+   struct stat sb;
+   if (stat(p, &sb) < 0)
+   {
+      /* File not found or other stat error */
+      const char *body = "<html><body>404 Not Found</body></html>\n";
+      send_response(nfd, "404 Not Found", body, 1);
+      return;
+   }
+
+   /* Ensure it's a regular file */
+   if (!S_ISREG(sb.st_mode))
+   {
+      const char *body = "<html><body>403 Permission Denied</body></html>\n";
+      send_response(nfd, "403 Permission Denied", body, 1);
+      return;
+   }
+
+   /* Try to open the file for reading */
+   int fd = open(p, O_RDONLY);
+   if (fd < 0)
+   {
+      /* Could be permission denied or other open error */
+      const char *body = "<html><body>403 Permission Denied</body></html>\n";
+      send_response(nfd, "403 Permission Denied", body, 1);
+      return;
+   }
+
+   /* Build and send headers */
+   (void)write_all(nfd, "HTTP/1.0 200 OK\r\n", 17);
+   (void)write_all(nfd, "Content-Type: text/html\r\n", 25);
+   (void)write_all(nfd, "Content-Length: ", 16);
+   write_size_t_as_decimal(nfd, (size_t)sb.st_size);
+   (void)write_all(nfd, "\r\n", 2);
+   (void)write_all(nfd, "\r\n", 2);
+
+   /* If method is HEAD, do not send body */
+   if (strcmp(method, "HEAD") == 0)
+   {
+      close(fd);
+      return;
+   }
+
+   /* Send file contents in chunks */
+   char buf[READ_BUF_SIZE];
+   ssize_t r;
+   while ((r = read(fd, buf, sizeof(buf))) > 0)
+   {
+      if (write_all(nfd, buf, (size_t)r) < 0)
+      {
+         /* Client closed or write error; stop sending */
+         break;
+      }
+   }
+
+   if (r < 0)
+   {
+      /* Read error */
+      /* Attempt to send a 500 if possible (note: we may have already sent headers) */
+   }
+
+   close(fd);
+}
+
 static void handle_request(int nfd)
 {
    /* nfd is the connected socket returned by accept_connection */
 
-   /* Convert socket descriptor to FILE* so we can read lines . */
+   /* Convert socket descriptor to FILE* so we can read lines (HTTP is line-based). */
    FILE *network = fdopen(nfd, "r");
    if (network == NULL)
    {
@@ -205,36 +302,25 @@ static void handle_request(int nfd)
       line[num - 1] = '\0';
    }
 
-   char *method = NULL;
-   char *path = NULL;
-   char *version = NULL;
+   {
+      char *method = NULL;
+      char *path = NULL;
+      char *version = NULL;
 
-   if (parse_request_line(line, &method, &path, &version) != 0)
-   {
-      const char *body =
-         "<html><body>400 Bad Request</body></html>\n";
-      send_response(nfd, "400 Bad Request", body, 1);
-   }
-   else if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)
-   {
-      const char *body =
-         "<html><body>501 Not Implemented</body></html>\n";
-      send_response(nfd, "501 Not Implemented", body, 1);
-   }
-   else
-   {
-      /* Valid request line and supported method.
- *          File-serving will be implemented in the next commits. */
-      const char *body =
-         "<html><body>200 OK</body></html>\n";
-
-      if (strcmp(method, "HEAD") == 0)
+      if (parse_request_line(line, &method, &path, &version) != 0)
       {
-         send_response(nfd, "200 OK", body, 0); /* header only */
+         const char *body = "<html><body>400 Bad Request</body></html>\n";
+         send_response(nfd, "400 Bad Request", body, 1);
+      }
+      else if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)
+      {
+         const char *body = "<html><body>501 Not Implemented</body></html>\n";
+         send_response(nfd, "501 Not Implemented", body, 1);
       }
       else
       {
-         send_response(nfd, "200 OK", body, 1); /* header + body */
+         /* Valid request line and supported method: serve static file (or HEAD). */
+         serve_static_file(nfd, path, method);
       }
    }
 
