@@ -14,6 +14,7 @@
 
 #define PORT 40000
 #define READ_BUF_SIZE 4096
+#define CGI_MAX_ARGS  32
 
 static void reap_children(int signum)
 {
@@ -174,6 +175,79 @@ static int parse_request_line(char *line, char **method, char **path, char **ver
    return 0;
 }
 
+/* Parse cgi-like request path.
+ *    Example: /cgi-like/ls?-l&index.html
+ *       Returns 0 on success, -1 on failure. */
+static int parse_cgi_path(char *path,
+                          char **prog,
+                          char *argv[],
+                          int *argc_out)
+{
+   char *p;
+   char *qmark;
+   int argc;
+
+   *prog = NULL;
+   *argc_out = 0;
+
+   /* Must start with /cgi-like/ */
+   if (strncmp(path, "/cgi-like/", 10) != 0)
+   {
+      return -1;
+   }
+
+   /* program name begins right after /cgi-like/ */
+   p = path + 10;
+   if (*p == '\0')
+   {
+      return -1;
+   }
+
+   /* Split program and query string */
+   qmark = strchr(p, '?');
+   if (qmark != NULL)
+   {
+      *qmark = '\0';
+      qmark++;
+   }
+
+   *prog = p;
+
+   /* argv[0] should be the program name */
+   argc = 0;
+   argv[argc++] = *prog;
+
+   /* No args if there is no '?' or it's empty */
+   if (qmark == NULL || *qmark == '\0')
+   {
+      argv[argc] = NULL;
+      *argc_out = argc;
+      return 0;
+   }
+
+   /* Split args on '&' */
+   while (*qmark != '\0' && argc < CGI_MAX_ARGS - 1)
+   {
+      argv[argc++] = qmark;
+
+      /* Find next '&' */
+      while (*qmark != '\0' && *qmark != '&')
+      {
+         qmark++;
+      }
+
+      if (*qmark == '&')
+      {
+         *qmark = '\0';
+         qmark++;
+      }
+   }
+
+   argv[argc] = NULL;
+   *argc_out = argc;
+   return 0;
+}
+
 static void serve_static_file(int nfd, const char *reqpath, const char *method)
 {
    /* reqpath starts with a leading '/' per HTTP request; remove it for local path */
@@ -257,7 +331,7 @@ static void serve_static_file(int nfd, const char *reqpath, const char *method)
    if (r < 0)
    {
       /* Read error */
-      /* Attempt to send a 500 if possible (note: we may have already sent headers) */
+      /* Attempt to send a 500 if possible */
    }
 
    close(fd);
@@ -267,7 +341,7 @@ static void handle_request(int nfd)
 {
    /* nfd is the connected socket returned by accept_connection */
 
-   /* Convert socket descriptor to FILE* so we can read lines (HTTP is line-based). */
+   /* Convert socket descriptor to FILE* so we can read lines. */
    FILE *network = fdopen(nfd, "r");
    if (network == NULL)
    {
@@ -319,13 +393,40 @@ static void handle_request(int nfd)
       }
       else
       {
-         /* Valid request line and supported method: serve static file (or HEAD). */
-         serve_static_file(nfd, path, method);
+         /* cgi-like requests are handled separately from static files */
+         if (strncmp(path, "/cgi-like/", 10) == 0)
+         {
+            char *prog;
+            char *argv[CGI_MAX_ARGS];
+            int argc;
+
+            if (strstr(path, "..") != NULL)
+            {
+               const char *body = "<html><body>403 Permission Denied</body></html>\n";
+               send_response(nfd, "403 Permission Denied", body, 1);
+            }
+            else if (parse_cgi_path(path, &prog, argv, &argc) != 0)
+            {
+               const char *body = "<html><body>400 Bad Request</body></html>\n";
+               send_response(nfd, "400 Bad Request", body, 1);
+            }
+            else
+            {
+               /* Execution will be implemented in the next commit. */
+               const char *body = "<html><body>501 Not Implemented</body></html>\n";
+               send_response(nfd, "501 Not Implemented", body, 1);
+            }
+         }
+         else
+         {
+            /* Valid request line and supported method: serve static file. */
+            serve_static_file(nfd, path, method);
+         }
       }
    }
 
    /* Do not close the socket until the client does.
- *       For now, read and ignore remaining lines until EOF. */
+      For now, read and ignore remaining lines until EOF. */
    while ((num = getline(&line, &size, network)) >= 0)
    {
       (void)num;
@@ -340,7 +441,7 @@ static void handle_request(int nfd)
 static void run_service(int fd)
 {
    /* Continuously accept client connections. For each connection, fork a child
- *       process to handle the request while the parent continues accepting. */
+     process to handle the request while the parent continues accepting. */
    while (1)
    {
       int nfd = accept_connection(fd);
