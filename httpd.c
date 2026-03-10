@@ -12,7 +12,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#define PORT 40000
 #define READ_BUF_SIZE 4096
 #define CGI_MAX_ARGS  32
 
@@ -248,6 +247,63 @@ static int parse_cgi_path(char *path,
    return 0;
 }
 
+static void build_temp_filename(char *out, size_t outsz, pid_t pid)
+{
+   /* Build: cgi-out-<pid>.tmp without snprintf. */
+   const char *prefix = "cgi-out-";
+   const char *suffix = ".tmp";
+   char rev[32];
+   char pidbuf[32];
+   int r = 0;
+   int i = 0;
+   size_t pos = 0;
+   size_t n;
+   size_t v;
+
+   /* copy prefix */
+   n = strlen(prefix);
+   if (pos + n + 1 < outsz)
+   {
+      memcpy(out + pos, prefix, n);
+      pos += n;
+   }
+
+   /* convert pid to decimal */
+   v = (size_t)pid;
+   if (v == 0)
+   {
+      pidbuf[i++] = '0';
+   }
+   else
+   {
+      while (v > 0 && r < (int)sizeof(rev))
+      {
+         rev[r++] = (char)('0' + (v % 10));
+         v /= 10;
+      }
+      while (r > 0)
+      {
+         pidbuf[i++] = rev[--r];
+      }
+   }
+
+   if (pos + (size_t)i + 1 < outsz)
+   {
+      memcpy(out + pos, pidbuf, (size_t)i);
+      pos += (size_t)i;
+   }
+
+   /* copy suffix */
+   n = strlen(suffix);
+   if (pos + n + 1 < outsz)
+   {
+      memcpy(out + pos, suffix, n);
+      pos += n;
+   }
+
+   out[pos] = '\0';
+}
+
 static void serve_static_file(int nfd, const char *reqpath, const char *method)
 {
    /* reqpath starts with a leading '/' per HTTP request; remove it for local path */
@@ -331,17 +387,179 @@ static void serve_static_file(int nfd, const char *reqpath, const char *method)
    if (r < 0)
    {
       /* Read error */
-      /* Attempt to send a 500 if possible */
+      /* Attempt to send a 500 if possible (note: we may have already sent headers) */
    }
 
    close(fd);
+}
+
+static void serve_cgi_like(int nfd, char *path, const char *method)
+{
+   char *prog;
+   char *argv[CGI_MAX_ARGS];
+   int argc;
+   pid_t pid;
+   int status;
+   char exec_path[256];
+   char tmpfile[256];
+
+   /* Prevent directory traversal attempts */
+   if (strstr(path, "..") != NULL)
+   {
+      const char *body = "<html><body>403 Permission Denied</body></html>\n";
+      send_response(nfd, "403 Permission Denied", body, 1);
+      return;
+   }
+
+   if (parse_cgi_path(path, &prog, argv, &argc) != 0)
+   {
+      const char *body = "<html><body>400 Bad Request</body></html>\n";
+      send_response(nfd, "400 Bad Request", body, 1);
+      return;
+   }
+
+   /* Program name should not contain '/' */
+   if (strchr(prog, '/') != NULL)
+   {
+      const char *body = "<html><body>403 Permission Denied</body></html>\n";
+      send_response(nfd, "403 Permission Denied", body, 1);
+      return;
+   }
+
+   /* Build exec path: ./cgi-like/<prog> */
+   {
+      const char *prefix = "./cgi-like/";
+      size_t pre = strlen(prefix);
+      size_t prg = strlen(prog);
+
+      if (pre + prg + 1 > sizeof(exec_path))
+      {
+         const char *body = "<html><body>500 Internal Error</body></html>\n";
+         send_response(nfd, "500 Internal Error", body, 1);
+         return;
+      }
+
+      memcpy(exec_path, prefix, pre);
+      memcpy(exec_path + pre, prog, prg);
+      exec_path[pre + prg] = '\0';
+   }
+
+   /* Fork to execute the cgi-like program */
+   pid = fork();
+   if (pid < 0)
+   {
+      const char *body = "<html><body>500 Internal Error</body></html>\n";
+      send_response(nfd, "500 Internal Error", body, 1);
+      return;
+   }
+
+   if (pid == 0)
+   {
+      /* Child process: redirect stdout to a temp file, then exec the program. */
+      int outfd;
+
+      build_temp_filename(tmpfile, sizeof(tmpfile), getpid());
+
+      outfd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (outfd < 0)
+      {
+         _exit(1);
+      }
+
+      if (dup2(outfd, STDOUT_FILENO) < 0)
+      {
+         close(outfd);
+         _exit(1);
+      }
+
+      close(outfd);
+
+      execv(exec_path, argv);
+
+      /* If exec returns, it failed */
+      _exit(1);
+   }
+
+   /* Parent process: wait for program to complete */
+   if (waitpid(pid, &status, 0) < 0)
+   {
+      const char *body = "<html><body>500 Internal Error</body></html>\n";
+      send_response(nfd, "500 Internal Error", body, 1);
+      return;
+   }
+
+   build_temp_filename(tmpfile, sizeof(tmpfile), pid);
+
+   /* If exec failed, treat as internal error */
+   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+   {
+      (void)unlink(tmpfile);
+      {
+         const char *body = "<html><body>500 Internal Error</body></html>\n";
+         send_response(nfd, "500 Internal Error", body, 1);
+      }
+      return;
+   }
+
+   /* Stat the output file to get Content-Length */
+   struct stat sb;
+   if (stat(tmpfile, &sb) < 0)
+   {
+      (void)unlink(tmpfile);
+      {
+         const char *body = "<html><body>500 Internal Error</body></html>\n";
+         send_response(nfd, "500 Internal Error", body, 1);
+      }
+      return;
+   }
+
+   /* Send headers */
+   (void)write_all(nfd, "HTTP/1.0 200 OK\r\n", 17);
+   (void)write_all(nfd, "Content-Type: text/html\r\n", 25);
+   (void)write_all(nfd, "Content-Length: ", 16);
+   write_size_t_as_decimal(nfd, (size_t)sb.st_size);
+   (void)write_all(nfd, "\r\n", 2);
+   (void)write_all(nfd, "\r\n", 2);
+
+   /* HEAD returns header only */
+   if (strcmp(method, "HEAD") == 0)
+   {
+      (void)unlink(tmpfile);
+      return;
+   }
+
+   /* Send the temp file contents */
+   int fd = open(tmpfile, O_RDONLY);
+   if (fd < 0)
+   {
+      (void)unlink(tmpfile);
+      {
+         const char *body = "<html><body>500 Internal Error</body></html>\n";
+         send_response(nfd, "500 Internal Error", body, 1);
+      }
+      return;
+   }
+
+   char buf[READ_BUF_SIZE];
+   ssize_t r;
+   while ((r = read(fd, buf, sizeof(buf))) > 0)
+   {
+      if (write_all(nfd, buf, (size_t)r) < 0)
+      {
+         /* Client closed or write error; stop sending */
+         break;
+      }
+   }
+
+   close(fd);
+   (void)unlink(tmpfile);
 }
 
 static void handle_request(int nfd)
 {
    /* nfd is the connected socket returned by accept_connection */
 
-   /* Convert socket descriptor to FILE* so we can read lines. */
+   /* Convert socket descriptor to FILE* so we can read lines (HTTP is line-based). */
    FILE *network = fdopen(nfd, "r");
    if (network == NULL)
    {
@@ -396,37 +614,18 @@ static void handle_request(int nfd)
          /* cgi-like requests are handled separately from static files */
          if (strncmp(path, "/cgi-like/", 10) == 0)
          {
-            char *prog;
-            char *argv[CGI_MAX_ARGS];
-            int argc;
-
-            if (strstr(path, "..") != NULL)
-            {
-               const char *body = "<html><body>403 Permission Denied</body></html>\n";
-               send_response(nfd, "403 Permission Denied", body, 1);
-            }
-            else if (parse_cgi_path(path, &prog, argv, &argc) != 0)
-            {
-               const char *body = "<html><body>400 Bad Request</body></html>\n";
-               send_response(nfd, "400 Bad Request", body, 1);
-            }
-            else
-            {
-               /* Execution will be implemented in the next commit. */
-               const char *body = "<html><body>501 Not Implemented</body></html>\n";
-               send_response(nfd, "501 Not Implemented", body, 1);
-            }
+            serve_cgi_like(nfd, path, method);
          }
          else
          {
-            /* Valid request line and supported method: serve static file. */
+            /* Valid request line and supported method: serve static file (or HEAD). */
             serve_static_file(nfd, path, method);
          }
       }
    }
 
    /* Do not close the socket until the client does.
-      For now, read and ignore remaining lines until EOF. */
+ *       For now, read and ignore remaining lines until EOF. */
    while ((num = getline(&line, &size, network)) >= 0)
    {
       (void)num;
@@ -441,7 +640,7 @@ static void handle_request(int nfd)
 static void run_service(int fd)
 {
    /* Continuously accept client connections. For each connection, fork a child
-     process to handle the request while the parent continues accepting. */
+ *       process to handle the request while the parent continues accepting. */
    while (1)
    {
       int nfd = accept_connection(fd);
@@ -471,7 +670,42 @@ static void run_service(int fd)
    }
 }
 
-int main(void)
+
+static int parse_port(const char *s, int *port_out)
+{
+   /* Parse a decimal port number without scanf/sscanf. */
+   long port = 0;
+   const char *p = s;
+
+   if (s == NULL || *s == '\0')
+   {
+      return -1;
+   }
+
+   while (*p != '\0')
+   {
+      if (*p < '0' || *p > '9')
+      {
+         return -1;
+      }
+      port = port * 10 + (*p - '0');
+      if (port > 65535)
+      {
+         return -1;
+      }
+      p++;
+   }
+
+   if (port < 1024 || port > 65535)
+   {
+      return -1;
+   }
+
+   *port_out = (int)port;
+   return 0;
+}
+
+int main(int argc, char **argv)
 {
    /* Register signal handler to reap terminated children. */
    if (signal(SIGCHLD, reap_children) == SIG_ERR)
@@ -480,15 +714,31 @@ int main(void)
       exit(1);
    }
 
-   /* Create server socket and bind to PORT. */
-   int fd = create_service(PORT);
+   /* Parse port argument. */
+   if (argc != 2)
+   {
+      const char *msg = "usage: ./httpd <port>\n";
+      (void)write(STDERR_FILENO, msg, strlen(msg));
+      exit(1);
+   }
+
+   int port;
+   if (parse_port(argv[1], &port) != 0)
+   {
+      const char *msg = "error: port must be an integer between 1024 and 65535\n";
+      (void)write(STDERR_FILENO, msg, strlen(msg));
+      exit(1);
+   }
+
+   /* Create server socket and bind to port. */
+   int fd = create_service(port);
    if (fd == -1)
    {
       perror("create_service");
       exit(1);
    }
 
-   printf("listening on port: %d\n", PORT);
+   printf("listening on port: %d\n", port);
 
    /* Start accepting connections. */
    run_service(fd);
