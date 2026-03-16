@@ -80,7 +80,7 @@ static void write_size_t_as_decimal(int fd, size_t value)
 static void send_response(int nfd, const char *status, const char *body, int send_body)
 {
    /* Send a minimal HTTP/1.0 response with Content-Type and Content-Length.
- *       Each header line ends with \r\n and the header ends with a blank line. */
+ *  *       Each header line ends with \r\n and the header ends with a blank line. */
 
    size_t body_len = 0;
    if (body != NULL)
@@ -107,7 +107,7 @@ static void send_response(int nfd, const char *status, const char *body, int sen
 }
 
 /* Parse: METHOD PATH VERSION
- *    Split by spaces by inserting '\0' terminators. */
+ *  *    Split by spaces by inserting '\0' terminators. */
 static int parse_request_line(char *line, char **method, char **path, char **version)
 {
    char *space1;
@@ -175,8 +175,8 @@ static int parse_request_line(char *line, char **method, char **path, char **ver
 }
 
 /* Parse cgi-like request path.
- *    Example: /cgi-like/ls?-l&index.html
- *       Returns 0 on success, -1 on failure. */
+ *  *    Example: /cgi-like/ls?-l&index.html
+ *   *       Returns 0 on success, -1 on failure. */
 static int parse_cgi_path(char *path,
                           char **prog,
                           char *argv[],
@@ -458,6 +458,8 @@ static void serve_cgi_like(int nfd, char *path, const char *method)
       /* Child process: redirect stdout to a temp file, then exec the program. */
       int outfd;
 
+      close(nfd);
+
       build_temp_filename(tmpfile, sizeof(tmpfile), getpid());
 
       outfd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -625,7 +627,7 @@ static void handle_request(int nfd)
    }
 
    /* Do not close the socket until the client does.
- *       For now, read and ignore remaining lines until EOF. */
+ *  *       For now, read and ignore remaining lines until EOF. */
    while ((num = getline(&line, &size, network)) >= 0)
    {
       (void)num;
@@ -640,7 +642,7 @@ static void handle_request(int nfd)
 static void run_service(int fd)
 {
    /* Continuously accept client connections. For each connection, fork a child
- *       process to handle the request while the parent continues accepting. */
+ *  *       process to handle the request while the parent continues accepting. */
    while (1)
    {
       int nfd = accept_connection(fd);
@@ -709,6 +711,13 @@ int main(int argc, char **argv)
 {
    /* Register signal handler to reap terminated children. */
    if (signal(SIGCHLD, reap_children) == SIG_ERR)
+   {
+      perror("signal");
+      exit(1);
+   }
+
+   /* Ignore SIGPIPE so client disconnects do not kill the process. */
+   if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
    {
       perror("signal");
       exit(1);
